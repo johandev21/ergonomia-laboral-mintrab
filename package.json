@@ -1,0 +1,40 @@
+{
+  "name": "mintrab-ergonomia",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vp dev",
+    "build": "tsc -b && vp build",
+    "lint": "vp lint",
+    "preview": "vp preview"
+  },
+  "dependencies": {
+    "@tensorflow-models/pose-detection": "^2.1.3",
+    "@tensorflow/tfjs": "^4.22.0",
+    "@ui-sdk/core": "0.1.0-beta.17",
+    "@ui-sdk/react": "0.1.0-beta.17",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1"
+  },
+  "devDependencies": {
+    "@testing-library/dom": "^10.4.2",
+    "@testing-library/react": "^16.3.3",
+    "@testing-library/user-event": "^14.6.13",
+    "@types/node": "^24.19.2",
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@vitejs/plugin-react": "^6.1.2",
+    "jsdom": "^31.0.1",
+    "typescript": "~7.0.2",
+    "vite": "catalog:",
+    "vite-plus": "catalog:"
+  },
+  "devEngines": {
+    "packageManager": {
+      "name": "pnpm",
+      "version": "12.23.0",
+      "onFail": "download"
+    }
+  }
+}
