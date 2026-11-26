@@ -1,6 +1,7 @@
 import type {
   AnalysisSide,
   CalibrationSettings,
+  ExerciseGuide,
   ExercisePhase,
   ExerciseType,
   KeypointMeta,
@@ -57,6 +58,39 @@ export const DEFAULT_CALIBRATION: CalibrationSettings = {
   showOverlay: true,
   mirrorCamera: true,
   targetReps: 10,
+};
+
+export const TARGET_REP_OPTIONS = [5, 10, 15] as const;
+
+export const EXERCISE_GUIDES: Record<ExerciseType, ExerciseGuide> = {
+  squat: {
+    framingTip: "Aléjate ~1,5 m de perfil o frente dejando visibles cadera, rodillas y tobillos.",
+    targetLabel: "Meta ≤ 108°",
+    steps: [
+      "Ponte de pie con espalda erguida",
+      "Flexiona rodillas hasta bajar la cadera",
+      "Vuelve a extender para sumar 1 repetición",
+    ],
+  },
+  "arm-raise": {
+    framingTip:
+      "Mantén visibles hombros y muñecas (funciona sentado o de pie, de frente o de costado).",
+    targetLabel: "Meta ≥ 135°",
+    steps: [
+      "Relaja los brazos a los costados",
+      "Eleva los brazos por sobre los hombros",
+      "Desciende de forma controlada (+1 rep)",
+    ],
+  },
+  "neck-tilt": {
+    framingTip: "Centra cabeza y hombros frente a la cámara con buena iluminación.",
+    targetLabel: "Meta ≥ 22°",
+    steps: [
+      "Mantén la cabeza centrada y hombros relajados",
+      "Inclina suavemente la oreja hacia un hombro",
+      "Regresa al centro sin forzar (+1 rep)",
+    ],
+  },
 };
 
 export const EXERCISE_OPTIONS: { value: ExerciseType; label: string }[] = [

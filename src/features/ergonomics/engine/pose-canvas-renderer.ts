@@ -160,7 +160,7 @@ function drawAnglePill(
 ): void {
   const label = `${Math.round(angleDeg)}°`;
   ctx.save();
-  ctx.font = `700 18px ${fontFamily}`;
+  ctx.font = `500 18px ${fontFamily}`;
   const textWidth = ctx.measureText(label).width;
   const pillW = Math.max(56, Math.ceil(textWidth) + 22);
   const pillH = 32;

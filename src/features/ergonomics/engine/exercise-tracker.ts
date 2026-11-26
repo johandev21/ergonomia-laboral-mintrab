@@ -101,6 +101,47 @@ function measureNeckTiltAngle(
   return null;
 }
 
+function pickArmRaiseFallbackAngle(
+  keypoints: readonly PoseKeypoint[],
+  side: AnalysisSide,
+  minConfidence: number,
+): number | null {
+  const getChain = (shoulderIdx: number, wristIdx: number) => {
+    const shoulder = validPoint(keypoints[shoulderIdx], minConfidence);
+    const wrist = validPoint(keypoints[wristIdx], minConfidence);
+    if (!shoulder || !wrist) return null;
+    return { shoulder, wrist, score: shoulder.score + wrist.score };
+  };
+
+  if (side === "left") {
+    const left = getChain(5, 9);
+    return left
+      ? calculateAngle({ x: left.shoulder.x, y: left.shoulder.y + 100 }, left.shoulder, left.wrist)
+      : null;
+  }
+  if (side === "right") {
+    const right = getChain(6, 10);
+    return right
+      ? calculateAngle(
+          { x: right.shoulder.x, y: right.shoulder.y + 100 },
+          right.shoulder,
+          right.wrist,
+        )
+      : null;
+  }
+
+  const left = getChain(5, 9);
+  const right = getChain(6, 10);
+  const chosen = left && right ? (left.score >= right.score ? left : right) : (left ?? right);
+  return chosen
+    ? calculateAngle(
+        { x: chosen.shoulder.x, y: chosen.shoulder.y + 100 },
+        chosen.shoulder,
+        chosen.wrist,
+      )
+    : null;
+}
+
 function getExerciseAngle(
   exercise: ExerciseType,
   keypoints: readonly PoseKeypoint[],
@@ -113,7 +154,9 @@ function getExerciseAngle(
   }
 
   if (exercise === "arm-raise") {
-    const angle = pickTripletAngle(keypoints, [11, 5, 9], [12, 6, 10], side, minConfidence);
+    const angle =
+      pickTripletAngle(keypoints, [11, 5, 9], [12, 6, 10], side, minConfidence) ??
+      pickArmRaiseFallbackAngle(keypoints, side, minConfidence);
     return angle === null ? null : round1(angle);
   }
 
@@ -141,7 +184,7 @@ function getMissingJointsFeedback(exercise: ExerciseType): string {
     return "Posiciona cadera, rodilla y tobillo dentro del encuadre.";
   }
   if (exercise === "arm-raise") {
-    return "Mantén visibles cadera, hombro y muñeca para medir la elevación.";
+    return "Mantén visibles hombros y muñecas dentro del encuadre para medir la elevación.";
   }
   return "Deja visibles cabeza y hombros frente a la cámara.";
 }
@@ -206,6 +249,7 @@ export function createExerciseTracker(
       phase,
       feedback,
       completed: reps >= targetReps,
+      hasReachedPeak,
     };
   }
 

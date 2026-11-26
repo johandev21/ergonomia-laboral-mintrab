@@ -10,25 +10,35 @@ import {
 import { Button } from "@ui-sdk/react/button";
 import { FileInput, FileInputTrigger } from "@ui-sdk/react/file-input";
 import type { RefObject } from "react";
-import { CANVAS_HEIGHT, CANVAS_WIDTH } from "../constants/ergonomics-options";
-import type { PostureStatus, StatusTone } from "../types/ergonomics.types";
+import { CANVAS_HEIGHT, CANVAS_WIDTH, EXERCISE_OPTIONS } from "../constants/ergonomics-options";
+import type {
+  AppMode,
+  ExerciseType,
+  SessionHistoryEvent,
+  SessionSummary,
+  StatusTone,
+} from "../types/ergonomics.types";
+import { computeOptimalPercent } from "../utils/format-ergonomics";
 
 const TIMELINE_SLOTS = Array.from({ length: 28 }, (_, slot) => `slot-${slot}`);
 
 export interface PostureStageProps {
   videoRef: RefObject<HTMLVideoElement | null>;
   canvasRef: RefObject<HTMLCanvasElement | null>;
+  mode: AppMode;
+  exercise: ExerciseType;
   cameraActive: boolean;
   photoActive: boolean;
   engineLoading: boolean;
   photoFiles: File[];
-  postureHistory: readonly PostureStatus[];
+  session: SessionSummary;
   statusMessage: string;
   statusTone: StatusTone;
   statusFileName?: string | null;
   onStartCamera: () => void;
   onStopCamera: () => void;
   onSelectPhotos: (files: File[]) => void;
+  onSelectExercise: (exercise: ExerciseType) => void;
   onResetSession: () => void;
   onClearRecords: () => void;
 }
@@ -36,17 +46,20 @@ export interface PostureStageProps {
 export function PostureStage({
   videoRef,
   canvasRef,
+  mode,
+  exercise,
   cameraActive,
   photoActive,
   engineLoading,
   photoFiles,
-  postureHistory,
+  session,
   statusMessage,
   statusTone,
   statusFileName,
   onStartCamera,
   onStopCamera,
   onSelectPhotos,
+  onSelectExercise,
   onResetSession,
   onClearRecords,
 }: PostureStageProps) {
@@ -60,7 +73,7 @@ export function PostureStage({
           height={CANVAS_HEIGHT}
           className="stage-canvas"
         />
-        {!cameraActive && !photoActive && <StageEmptyState />}
+        {!cameraActive && !photoActive && <StageEmptyState mode={mode} />}
       </div>
 
       <StageActionBar
@@ -74,7 +87,15 @@ export function PostureStage({
         onClearRecords={onClearRecords}
       />
 
-      <PostureTimeline history={postureHistory} />
+      {mode === "postura" ? (
+        <PostureTimeline session={session} />
+      ) : (
+        <ActiveBreakRoutineCard
+          exercise={exercise}
+          historyEvents={session.historyEvents}
+          onSelectExercise={onSelectExercise}
+        />
+      )}
 
       <div
         className="status-banner"
@@ -95,13 +116,22 @@ export function PostureStage({
   );
 }
 
-function StageEmptyState() {
+interface StageEmptyStateProps {
+  mode: AppMode;
+}
+
+function StageEmptyState({ mode }: StageEmptyStateProps) {
   return (
     <div className="stage-empty">
-      <h2 className="stage-empty-title">Evaluación postural en navegador</h2>
+      <h2 className="stage-empty-title">
+        {mode === "postura"
+          ? "Evaluación postural en navegador"
+          : "Pausa activa guiada en navegador"}
+      </h2>
       <p className="stage-empty-copy">
-        Active la cámara web o cargue una fotografía para medir alineación cervical, hombros y
-        pausas activas sin enviar datos fuera de su equipo.
+        {mode === "postura"
+          ? "Active la cámara web o cargue una fotografía para medir alineación cervical, hombros y pausas activas sin enviar datos fuera de su equipo."
+          : "Active la cámara web para seguir paso a paso las repeticiones de su pausa activa sin enviar datos fuera de su equipo."}
       </p>
     </div>
   );
@@ -167,20 +197,19 @@ function StageActionBar({
 }
 
 interface PostureTimelineProps {
-  history: readonly PostureStatus[];
+  session: SessionSummary;
 }
 
-function PostureTimeline({ history }: PostureTimelineProps) {
-  const optimalCount = history.filter((status) => status === "optima").length;
-  const alertCount = history.filter(
-    (status) => status === "advertencia" || status === "riesgo",
-  ).length;
-  const optimalPercent = history.length > 0 ? Math.round((optimalCount / history.length) * 100) : 0;
-  const alertLabel = alertCount === 1 ? "1 alerta" : `${alertCount} alertas`;
+function PostureTimeline({ session }: PostureTimelineProps) {
+  const optimalPercent = computeOptimalPercent(session);
+  const alertEpisodeCount = session.historyEvents.filter((ev) => ev.kind === "postura").length;
+  const alertLabel = alertEpisodeCount === 1 ? "1 alerta" : `${alertEpisodeCount} alertas`;
+  const frameLabel =
+    session.framesAnalyzed === 1 ? "1 lectura" : `${session.framesAnalyzed} cuadros`;
   const summary =
-    history.length === 0
-      ? "Sin lecturas aún · últimos 28 cuadros"
-      : `${optimalPercent}% óptima · ${alertLabel} · ${history.length}\u00A0/\u00A028 cuadros`;
+    session.framesAnalyzed === 0 && session.postureHistory.length === 0
+      ? "Sin lecturas aún · historial de la sesión"
+      : `${optimalPercent}% óptima · ${alertLabel} · ${frameLabel}`;
 
   return (
     <section className="timeline-card" aria-label="Estabilidad postural de la sesión">
@@ -190,8 +219,56 @@ function PostureTimeline({ history }: PostureTimelineProps) {
       </div>
       <div className="ticks-row" aria-hidden="true">
         {TIMELINE_SLOTS.map((slotId, index) => {
-          const status = history[index] ?? "idle";
+          const status = session.postureHistory[index] ?? "idle";
           return <span key={slotId} className="timeline-tick" data-status={status} />;
+        })}
+      </div>
+    </section>
+  );
+}
+
+interface ActiveBreakRoutineCardProps {
+  exercise: ExerciseType;
+  historyEvents: readonly SessionHistoryEvent[];
+  onSelectExercise: (exercise: ExerciseType) => void;
+}
+
+function ActiveBreakRoutineCard({
+  exercise,
+  historyEvents,
+  onSelectExercise,
+}: ActiveBreakRoutineCardProps) {
+  const completedSet = new Set(
+    historyEvents.filter((ev) => ev.kind === "pausa").map((ev) => ev.exercise),
+  );
+
+  return (
+    <section className="routine-card" aria-label="Rutina de pausa activa">
+      <div className="routine-header">
+        <span className="routine-title">Rutina de pausa activa</span>
+        <span className="routine-summary">
+          {`${completedSet.size}\u00A0/\u00A0${EXERCISE_OPTIONS.length} ejercicios completados`}
+        </span>
+      </div>
+      <div className="routine-grid">
+        {EXERCISE_OPTIONS.map((opt) => {
+          const isDone = completedSet.has(opt.value);
+          const isActive = opt.value === exercise;
+          const stateLabel = isDone ? "Completado" : isActive ? "En curso" : "Pendiente";
+
+          return (
+            <button
+              key={opt.value}
+              type="button"
+              className="routine-item"
+              data-active={isActive ? "true" : "false"}
+              data-completed={isDone ? "true" : "false"}
+              onClick={() => onSelectExercise(opt.value)}
+            >
+              <span className="routine-item-name">{opt.label}</span>
+              <span className="routine-item-state">{stateLabel}</span>
+            </button>
+          );
         })}
       </div>
     </section>
@@ -217,8 +294,8 @@ function ClearRecordsDialog({ onConfirm }: ClearRecordsDialogProps) {
         <div>
           <AlertDialogTitle>¿Borrar el registro ergonómico?</AlertDialogTitle>
           <AlertDialogDescription>
-            Esta acción elimina todas las métricas acumuladas, los cuadros analizados y el progreso
-            de pausas activas de la sesión actual.
+            Esta acción elimina todas las métricas acumuladas, el historial de alertas guardado y el
+            progreso de pausas activas.
           </AlertDialogDescription>
         </div>
         <div className="dialog-footer">

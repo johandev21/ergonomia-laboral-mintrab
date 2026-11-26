@@ -1,7 +1,7 @@
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { createAgent } from "@ui-sdk/react/agent";
-import { describe, expect, test, vi } from "vite-plus/test";
+import { beforeEach, describe, expect, test, vi } from "vite-plus/test";
 import {
   ErgonomicsWorkbench,
   KEYPOINT_META,
@@ -103,6 +103,10 @@ function installMockImage(): () => void {
 }
 
 describe("ErgonomicsWorkbench", () => {
+  beforeEach(() => {
+    window.localStorage.clear();
+  });
+
   test("an agent can inspect every control and drive mode, exercise, model and overlay", async () => {
     const mock = createMockEngine();
     render(<ErgonomicsWorkbench engineFactory={() => mock.engine} />);
@@ -188,7 +192,7 @@ describe("ErgonomicsWorkbench", () => {
       render(<ErgonomicsWorkbench engineFactory={() => mock.engine} />);
       await screen.findByText(/Modelo MoveNet listo/i);
 
-      expect(screen.getByText(/Sin lecturas aún · últimos 28 cuadros/i)).toBeTruthy();
+      expect(screen.getByText(/Sin lecturas aún · historial de la sesión/i)).toBeTruthy();
 
       const fileInput = document.querySelector<HTMLInputElement>(
         '[data-slot="file-input"] input[type="file"]',
@@ -205,9 +209,7 @@ describe("ErgonomicsWorkbench", () => {
           "Fotografía analizada: postura.png.",
         );
       });
-      expect(screen.getByText(/100% óptima · 0 alertas · 1 \/ 28 cuadros/i).textContent).toBe(
-        "100% óptima · 0 alertas · 1\u00A0/\u00A028 cuadros",
-      );
+      expect(screen.getByText(/100% óptima · 0 alertas · 1 lectura/i)).toBeTruthy();
       expect(document.querySelectorAll('.timeline-tick[data-status="optima"]')).toHaveLength(1);
       expect(document.querySelectorAll('.timeline-tick[data-status="idle"]')).toHaveLength(27);
 
@@ -238,7 +240,7 @@ describe("ErgonomicsWorkbench", () => {
       expect(screen.getByRole("status", { name: "Estado del análisis" }).textContent).toContain(
         "Registro ergonómico borrado.",
       );
-      expect(screen.getByText(/Sin lecturas aún · últimos 28 cuadros/i)).toBeTruthy();
+      expect(screen.getByText(/Sin lecturas aún · historial de la sesión/i)).toBeTruthy();
       expect(document.querySelectorAll('.timeline-tick[data-status="idle"]')).toHaveLength(28);
       expect(mock.reset).toHaveBeenCalled();
     } finally {
@@ -315,6 +317,113 @@ describe("ErgonomicsWorkbench", () => {
       expect(
         screen.getByRole("meter", { name: "Índice ergonómico" }).getAttribute("aria-valuenow"),
       ).not.toBe("0");
+    } finally {
+      restoreImage();
+    }
+  });
+
+  test("records bad-posture alert in Historial tab and preserves it after returning to optimal posture", async () => {
+    const restoreImage = installMockImage();
+    const user = userEvent.setup({ pointerEventsCheck: 0 });
+    const mock = createMockEngine();
+
+    const riskKeypoints: PoseKeypoint[] = KEYPOINT_META.map((meta) => {
+      const overrides: Record<number, [number, number, number]> = {
+        3: [390, 150, 0.94],
+        5: [300, 260, 0.95],
+        11: [300, 420, 0.92],
+      };
+      const [x, y, score] = overrides[meta.index] ?? [0, 0, 0];
+      return { index: meta.index, name: meta.name, labelEs: meta.labelEs, x, y, score };
+    });
+
+    mock.estimate
+      .mockResolvedValueOnce({ keypoints: riskKeypoints, inferenceMs: 14.2 })
+      .mockResolvedValueOnce({ keypoints: createOptimalKeypoints(), inferenceMs: 11.1 });
+
+    try {
+      render(<ErgonomicsWorkbench engineFactory={() => mock.engine} />);
+      await screen.findByText(/Modelo MoveNet listo/i);
+
+      const fileInput = document.querySelector<HTMLInputElement>(
+        '[data-slot="file-input"] input[type="file"]',
+      );
+      expect(fileInput).not.toBeNull();
+
+      await user.upload(fileInput!, new File(["bad"], "mala-postura.png", { type: "image/png" }));
+      await waitFor(() => {
+        expect(mock.estimate).toHaveBeenCalledTimes(1);
+      });
+
+      await user.upload(fileInput!, new File(["good"], "buena-postura.png", { type: "image/png" }));
+      await waitFor(() => {
+        expect(mock.estimate).toHaveBeenCalledTimes(2);
+      });
+
+      // Timeline still shows the 1 alert even after returning to optimal posture
+      expect(screen.getByText(/50% óptima · 1 alerta · 2 cuadros/i)).toBeTruthy();
+
+      // Open Historial tab and verify alert + CSV button
+      await user.click(screen.getByRole("tab", { name: "Historial" }));
+      expect(screen.getByText(/Sobrecarga cervical marcada/i)).toBeTruthy();
+      expect(screen.getByText(/mala-postura\.png/i)).toBeTruthy();
+      const exportBtn = screen.getByRole("button", { name: "Exportar CSV" });
+      expect(exportBtn.hasAttribute("disabled")).toBe(false);
+    } finally {
+      restoreImage();
+    }
+  });
+
+  test("Pausa activa hides bad-posture UI, shows 3-step guide + routine card, and avoids false posture alerts", async () => {
+    const restoreImage = installMockImage();
+    const user = userEvent.setup({ pointerEventsCheck: 0 });
+    const mock = createMockEngine();
+
+    const riskKeypoints: PoseKeypoint[] = KEYPOINT_META.map((meta) => {
+      const overrides: Record<number, [number, number, number]> = {
+        3: [390, 150, 0.94],
+        5: [300, 260, 0.95],
+        11: [300, 420, 0.92],
+      };
+      const [x, y, score] = overrides[meta.index] ?? [0, 0, 0];
+      return { index: meta.index, name: meta.name, labelEs: meta.labelEs, x, y, score };
+    });
+
+    mock.estimate.mockResolvedValueOnce({ keypoints: riskKeypoints, inferenceMs: 13.0 });
+
+    try {
+      render(<ErgonomicsWorkbench engineFactory={() => mock.engine} />);
+      await screen.findByText(/Modelo MoveNet listo/i);
+
+      // Switch to Pausa activa
+      await user.click(screen.getByRole("radio", { name: "Pausa activa" }));
+
+      // Posture meter and posture timeline must be hidden in Pausa activa
+      expect(screen.queryByRole("meter", { name: "Índice ergonómico" })).toBeNull();
+      expect(screen.queryByText(/Estabilidad postural de la sesión/i)).toBeNull();
+
+      // Routine card and 3-step guide must be shown
+      expect(screen.getByText(/Rutina de pausa activa/i)).toBeTruthy();
+      expect(screen.getByText(/0\s*\/\s*3 ejercicios completados/i)).toBeTruthy();
+      expect(screen.getByRole("list", { name: "Pasos del ejercicio" })).toBeTruthy();
+
+      // Clicking a routine card item switches the active exercise
+      await user.click(screen.getByRole("button", { name: /Elevación de brazos/i }));
+      expect(
+        screen.getByRole("combobox", { name: /Ejercicio de pausa activa/i }).textContent,
+      ).toContain("Elevación de brazos");
+
+      // Analyzing a bent/slouched photo during Pausa activa does NOT log a false posture alert
+      const fileInput = document.querySelector<HTMLInputElement>(
+        '[data-slot="file-input"] input[type="file"]',
+      );
+      await user.upload(fileInput!, new File(["break"], "pausa.png", { type: "image/png" }));
+      await waitFor(() => {
+        expect(mock.estimate).toHaveBeenCalledTimes(1);
+      });
+
+      await user.click(screen.getByRole("tab", { name: "Historial" }));
+      expect(screen.getByText(/Aún no hay alertas posturales ni pausas completadas/i)).toBeTruthy();
     } finally {
       restoreImage();
     }

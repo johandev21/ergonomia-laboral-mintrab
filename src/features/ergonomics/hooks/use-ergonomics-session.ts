@@ -1,22 +1,36 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { CANVAS_HEIGHT, CANVAS_WIDTH, DEFAULT_CALIBRATION } from "../constants/ergonomics-options";
+import {
+  CANVAS_HEIGHT,
+  CANVAS_WIDTH,
+  DEFAULT_CALIBRATION,
+  EXERCISE_OPTIONS,
+} from "../constants/ergonomics-options";
 import { evaluateDeskPosture } from "../engine/evaluate-posture";
 import { createExerciseTracker, type ExerciseTracker } from "../engine/exercise-tracker";
 import { createMoveNetEngine } from "../engine/movenet-engine";
 import { drawPoseFrame } from "../engine/pose-canvas-renderer";
+import {
+  createSessionHistoryStore,
+  downloadHistoryCsv,
+  type SessionHistoryStore,
+} from "../engine/session-history";
 import type {
   AppMode,
   CalibrationSettings,
   ExerciseSnapshot,
   ExerciseType,
+  HistorySource,
   ModelVariant,
   PoseEngine,
   PoseKeypoint,
   PostureMetrics,
+  PostureStatus,
   SessionSummary,
   StatusTone,
 } from "../types/ergonomics.types";
 import { renderFileToOffscreenCanvas } from "../utils/load-image-file";
+
+const UI_SYNC_INTERVAL_MS = 150;
 
 export interface UseErgonomicsSessionOptions {
   engineFactory?: () => PoseEngine;
@@ -65,15 +79,11 @@ export function useErgonomicsSession({
     phase: "esperando",
     feedback: "Ubíquese frente a la cámara para iniciar la pausa activa.",
     completed: false,
+    hasReachedPeak: false,
   }));
-  const [session, setSession] = useState<SessionSummary>({
-    framesAnalyzed: 0,
-    optimalFrames: 0,
-    alertFrames: 0,
-    lastInferenceMs: null,
-    backend: "",
-    postureHistory: [],
-  });
+  const [historyStore] = useState<SessionHistoryStore>(() => createSessionHistoryStore());
+  const historyRef = useRef<SessionHistoryStore>(historyStore);
+  const [session, setSession] = useState<SessionSummary>(() => historyStore.getSummary());
 
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -81,6 +91,10 @@ export function useErgonomicsSession({
   const rafRef = useRef<number | null>(null);
   const inFlightRef = useRef(false);
   const mountedRef = useRef(true);
+  const lastUiCommitAtRef = useRef(0);
+  const lastCommittedStatusRef = useRef<PostureStatus>("sin-pose");
+  const lastCommittedExerciseKeyRef = useRef("");
+  const breakLoggedRef = useRef(false);
 
   const engineRef = useRef<PoseEngine | null>(null);
   const engineFactoryRef = useRef(engineFactory);
@@ -110,7 +124,8 @@ export function useErgonomicsSession({
         if (!mountedRef.current) return null;
         setEngineReady(true);
         setEngineLoading(false);
-        setSession((prev) => ({ ...prev, backend: result.backend }));
+        historyRef.current!.setBackend(result.backend);
+        setSession(historyRef.current!.getSummary());
         return engineRef.current;
       } catch {
         if (!mountedRef.current) return null;
@@ -153,6 +168,8 @@ export function useErgonomicsSession({
 
     const handlePageHide = () => {
       stopCameraTracks();
+      historyStore.finalizeActiveEpisode(Date.now());
+      historyStore.persist();
     };
     window.addEventListener("pagehide", handlePageHide);
 
@@ -160,58 +177,129 @@ export function useErgonomicsSession({
       mountedRef.current = false;
       window.removeEventListener("pagehide", handlePageHide);
       stopCameraTracks();
+      historyStore.finalizeActiveEpisode(Date.now());
+      historyStore.persist();
       engineRef.current?.dispose();
       engineRef.current = null;
     };
-  }, [ensureEngine, initialAutoInit, stopCameraTracks, updateStatus]);
+  }, [ensureEngine, historyStore, initialAutoInit, stopCameraTracks, updateStatus]);
 
   const applyPoseEvaluation = useCallback(
     (
       nextKeypoints: PoseKeypoint[],
       inferenceMs: number,
       source: HTMLVideoElement | HTMLCanvasElement | HTMLImageElement,
-      mirrorOverride?: boolean,
+      options?: {
+        mirrorOverride?: boolean;
+        sourceKind?: HistorySource;
+        fileName?: string;
+      },
     ) => {
       const currentCal = calibrationRef.current;
       const currentMode = modeRef.current;
       const currentExercise = exerciseRef.current;
+      const sourceKind: HistorySource = options?.sourceKind ?? "camara";
+      const now = Date.now();
+      const history = historyRef.current!;
+      const ctx = canvasRef.current?.getContext("2d");
 
-      const posture = evaluateDeskPosture(nextKeypoints, currentCal);
-      setKeypoints(nextKeypoints);
-      setPostureMetrics(posture);
-
-      let highlightAngle = posture.neckAngleDeg;
       if (currentMode === "pausa") {
         const snap = trackerRef.current.update(nextKeypoints, currentCal);
-        setExerciseSnapshot(snap);
-        highlightAngle = snap.currentAngleDeg;
+        const exerciseKey = `${snap.exercise}:${snap.reps}:${snap.targetReps}:${snap.phase}:${snap.completed}:${snap.hasReachedPeak}`;
+        let breakRecorded = false;
+
+        history.recordActiveBreakFrame(inferenceMs);
+
+        if (snap.completed && !breakLoggedRef.current) {
+          breakLoggedRef.current = true;
+          history.recordCompletedBreak(currentExercise, snap.reps, snap.targetReps, now);
+          history.persist();
+          breakRecorded = true;
+        }
+
+        const isAtTargetPeak =
+          currentExercise === "squat" ? snap.phase === "abajo" : snap.phase === "arriba";
+        let drawStatus: PostureStatus;
+        if (snap.completed || isAtTargetPeak) {
+          drawStatus = "optima";
+        } else if (snap.currentAngleDeg === null || snap.phase === "esperando") {
+          drawStatus = "sin-pose";
+        } else {
+          drawStatus = "advertencia";
+        }
+
+        if (ctx) {
+          drawPoseFrame(ctx, source, nextKeypoints, {
+            width: CANVAS_WIDTH,
+            height: CANVAS_HEIGHT,
+            minConfidence: currentCal.minConfidence,
+            showOverlay: currentCal.showOverlay,
+            mirror: options?.mirrorOverride ?? currentCal.mirrorCamera,
+            status: drawStatus,
+            mode: currentMode,
+            exercise: currentExercise,
+            side: currentCal.side,
+            highlightAngleDeg: snap.currentAngleDeg,
+          });
+        }
+
+        const shouldCommitUi =
+          sourceKind === "foto" ||
+          breakRecorded ||
+          exerciseKey !== lastCommittedExerciseKeyRef.current ||
+          now - lastUiCommitAtRef.current >= UI_SYNC_INTERVAL_MS;
+
+        if (shouldCommitUi) {
+          lastUiCommitAtRef.current = now;
+          lastCommittedExerciseKeyRef.current = exerciseKey;
+          setKeypoints(nextKeypoints);
+          setExerciseSnapshot(snap);
+          setSession(history.getSummary());
+        }
+        return;
       }
 
-      setSession((prev) => ({
-        ...prev,
-        framesAnalyzed: prev.framesAnalyzed + 1,
-        optimalFrames: prev.optimalFrames + (posture.status === "optima" ? 1 : 0),
-        alertFrames:
-          prev.alertFrames +
-          (posture.status === "advertencia" || posture.status === "riesgo" ? 1 : 0),
-        lastInferenceMs: inferenceMs,
-        postureHistory: [...prev.postureHistory, posture.status].slice(-28),
-      }));
+      const posture = evaluateDeskPosture(nextKeypoints, currentCal);
 
-      const ctx = canvasRef.current?.getContext("2d");
       if (ctx) {
         drawPoseFrame(ctx, source, nextKeypoints, {
           width: CANVAS_WIDTH,
           height: CANVAS_HEIGHT,
           minConfidence: currentCal.minConfidence,
           showOverlay: currentCal.showOverlay,
-          mirror: mirrorOverride ?? currentCal.mirrorCamera,
+          mirror: options?.mirrorOverride ?? currentCal.mirrorCamera,
           status: posture.status,
           mode: currentMode,
           exercise: currentExercise,
           side: currentCal.side,
-          highlightAngleDeg: highlightAngle,
+          highlightAngleDeg: posture.neckAngleDeg,
         });
+      }
+
+      const historyResult = history.recordFrame({
+        posture,
+        inferenceMs,
+        now,
+        source: sourceKind,
+        fileName: options?.fileName,
+      });
+
+      if (historyResult.shouldPersist) {
+        history.persist();
+      }
+
+      const shouldCommitUi =
+        sourceKind === "foto" ||
+        historyResult.structuralChange ||
+        posture.status !== lastCommittedStatusRef.current ||
+        now - lastUiCommitAtRef.current >= UI_SYNC_INTERVAL_MS;
+
+      if (shouldCommitUi) {
+        lastUiCommitAtRef.current = now;
+        lastCommittedStatusRef.current = posture.status;
+        setKeypoints(nextKeypoints);
+        setPostureMetrics(posture);
+        setSession(history.getSummary());
       }
     },
     [],
@@ -302,6 +390,10 @@ export function useErgonomicsSession({
 
   const handleStopCamera = useCallback(() => {
     stopCameraTracks();
+    const history = historyRef.current!;
+    history.finalizeActiveEpisode(Date.now());
+    history.persist();
+    setSession(history.getSummary());
     updateStatus("Cámara detenida.");
   }, [stopCameraTracks, updateStatus]);
 
@@ -327,7 +419,11 @@ export function useErgonomicsSession({
         const result = await engine.estimate(offscreen);
         if (!mountedRef.current) return;
 
-        applyPoseEvaluation(result.keypoints, result.inferenceMs, offscreen, false);
+        applyPoseEvaluation(result.keypoints, result.inferenceMs, offscreen, {
+          mirrorOverride: false,
+          sourceKind: "foto",
+          fileName: file.name,
+        });
         setPhotoActive(true);
         updateStatus(`Fotografía analizada: ${file.name}.`, "neutral", file.name);
       } catch {
@@ -338,11 +434,66 @@ export function useErgonomicsSession({
     [applyPoseEvaluation, engineReady, ensureEngine, stopCameraTracks, updateStatus],
   );
 
+  const handleModeChange = useCallback((nextMode: AppMode) => {
+    if (nextMode === "pausa") {
+      const history = historyRef.current!;
+      history.finalizeActiveEpisode(Date.now());
+      history.persist();
+      setSession(history.getSummary());
+      breakLoggedRef.current = false;
+      lastCommittedExerciseKeyRef.current = "";
+    }
+    modeRef.current = nextMode;
+    setMode(nextMode);
+  }, []);
+
   const handleExerciseChange = useCallback((nextExercise: ExerciseType) => {
+    exerciseRef.current = nextExercise;
     setExercise(nextExercise);
+    breakLoggedRef.current = false;
+    lastCommittedExerciseKeyRef.current = "";
     const snap = trackerRef.current.reset(nextExercise, calibrationRef.current.targetReps);
     setExerciseSnapshot(snap);
   }, []);
+
+  const handleTargetRepsChange = useCallback((reps: number) => {
+    const nextCal: CalibrationSettings = { ...calibrationRef.current, targetReps: reps };
+    calibrationRef.current = nextCal;
+    setCalibration((prev) => ({ ...prev, targetReps: reps }));
+    breakLoggedRef.current = false;
+    lastCommittedExerciseKeyRef.current = "";
+    const snap = trackerRef.current.reset(exerciseRef.current, reps);
+    setExerciseSnapshot(snap);
+  }, []);
+
+  const handleRepeatExercise = useCallback(() => {
+    breakLoggedRef.current = false;
+    lastCommittedExerciseKeyRef.current = "";
+    const snap = trackerRef.current.reset(exerciseRef.current, calibrationRef.current.targetReps);
+    setExerciseSnapshot(snap);
+  }, []);
+
+  const handleNextExercise = useCallback(() => {
+    const completedExercises = new Set(
+      historyRef
+        .current!.getSummary()
+        .historyEvents.filter((ev) => ev.kind === "pausa")
+        .map((ev) => ev.exercise),
+    );
+    const currentIdx = EXERCISE_OPTIONS.findIndex((opt) => opt.value === exerciseRef.current);
+    const baseIdx = currentIdx >= 0 ? currentIdx : 0;
+    for (let offset = 1; offset <= EXERCISE_OPTIONS.length; offset += 1) {
+      const candidate = EXERCISE_OPTIONS[(baseIdx + offset) % EXERCISE_OPTIONS.length];
+      if (candidate && !completedExercises.has(candidate.value)) {
+        handleExerciseChange(candidate.value);
+        return;
+      }
+    }
+    const fallback = EXERCISE_OPTIONS[(baseIdx + 1) % EXERCISE_OPTIONS.length];
+    if (fallback) {
+      handleExerciseChange(fallback.value);
+    }
+  }, [handleExerciseChange]);
 
   const handleModelVariantChange = useCallback(
     async (nextVariant: ModelVariant) => {
@@ -357,7 +508,8 @@ export function useErgonomicsSession({
         if (!mountedRef.current) return;
         setEngineLoading(false);
         setEngineReady(true);
-        setSession((prev) => ({ ...prev, backend: res.backend }));
+        historyRef.current!.setBackend(res.backend);
+        setSession(historyRef.current!.getSummary());
         updateStatus(
           nextVariant === "thunder"
             ? "Modelo actualizado a MoveNet Thunder (precisión)."
@@ -372,29 +524,30 @@ export function useErgonomicsSession({
     [ensureEngine, updateStatus],
   );
 
-  const resetTrackerAndSession = useCallback(
-    (message: string) => {
-      engineRef.current?.reset();
-      const snap = trackerRef.current.reset(exerciseRef.current, calibrationRef.current.targetReps);
-      setExerciseSnapshot(snap);
-      setSession((prev) => ({
-        framesAnalyzed: 0,
-        optimalFrames: 0,
-        alertFrames: 0,
-        lastInferenceMs: null,
-        backend: prev.backend,
-        postureHistory: [],
-      }));
-      updateStatus(message);
-    },
-    [updateStatus],
-  );
-
   const handleResetSession = useCallback(() => {
-    resetTrackerAndSession("Sesión ergonómica reiniciada.");
-  }, [resetTrackerAndSession]);
+    const history = historyRef.current!;
+    history.finalizeActiveEpisode(Date.now());
+    breakLoggedRef.current = false;
+    lastCommittedExerciseKeyRef.current = "";
+    lastCommittedStatusRef.current = "sin-pose";
+    lastUiCommitAtRef.current = 0;
+    engineRef.current?.reset();
+    const snap = trackerRef.current.reset(exerciseRef.current, calibrationRef.current.targetReps);
+    setExerciseSnapshot(snap);
+    setSession(history.getSummary());
+    updateStatus("Sesión reiniciada. El historial acumulado se conserva.");
+  }, [updateStatus]);
 
   const handleClearRecords = useCallback(() => {
+    const history = historyRef.current!;
+    history.clearAll();
+    breakLoggedRef.current = false;
+    lastCommittedExerciseKeyRef.current = "";
+    lastCommittedStatusRef.current = "sin-pose";
+    lastUiCommitAtRef.current = 0;
+    engineRef.current?.reset();
+    const snap = trackerRef.current.reset(exerciseRef.current, calibrationRef.current.targetReps);
+    setExerciseSnapshot(snap);
     setKeypoints([]);
     setPostureMetrics(evaluateDeskPosture([], calibrationRef.current));
     setPhotoFiles([]);
@@ -403,8 +556,13 @@ export function useErgonomicsSession({
     if (ctx) {
       ctx.clearRect(0, 0, CANVAS_WIDTH, CANVAS_HEIGHT);
     }
-    resetTrackerAndSession("Registro ergonómico borrado.");
-  }, [resetTrackerAndSession]);
+    setSession(history.getSummary());
+    updateStatus("Registro ergonómico borrado.");
+  }, [updateStatus]);
+
+  const handleExportHistoryCsv = useCallback(() => {
+    downloadHistoryCsv(historyRef.current!.getSummary().historyEvents);
+  }, []);
 
   return {
     mode,
@@ -428,9 +586,14 @@ export function useErgonomicsSession({
     handleStartCamera,
     handleStopCamera,
     handlePhotoSelection,
+    handleModeChange,
     handleExerciseChange,
+    handleTargetRepsChange,
+    handleNextExercise,
+    handleRepeatExercise,
     handleModelVariantChange,
     handleResetSession,
     handleClearRecords,
+    handleExportHistoryCsv,
   };
 }

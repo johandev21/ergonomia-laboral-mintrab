@@ -12,6 +12,44 @@ export type ExercisePhase = "esperando" | "arriba" | "abajo" | "transicion";
 
 export type StatusTone = "neutral" | "error";
 
+export type HistorySource = "camara" | "foto";
+
+export type AlertSeverity = "advertencia" | "riesgo";
+
+export interface PostureAlertEpisode {
+  id: string;
+  kind: "postura";
+  startedAt: number;
+  endedAt: number | null;
+  durationMs: number;
+  severity: AlertSeverity;
+  minScore: number;
+  peakNeckAngleDeg: number | null;
+  peakShoulderTiltDeg: number | null;
+  peakTorsoLeanDeg: number | null;
+  diagnosis: string;
+  source: HistorySource;
+  fileName?: string;
+}
+
+export interface CompletedBreakEvent {
+  id: string;
+  kind: "pausa";
+  timestamp: number;
+  exercise: ExerciseType;
+  exerciseLabel: string;
+  reps: number;
+  targetReps: number;
+}
+
+export type SessionHistoryEvent = PostureAlertEpisode | CompletedBreakEvent;
+
+export interface TimelineBucket {
+  timestamp: number;
+  status: PostureStatus;
+  minScore: number;
+}
+
 export interface KeypointMeta {
   index: number;
   name: string;
@@ -37,6 +75,12 @@ export interface CalibrationSettings {
   targetReps: number;
 }
 
+export interface ExerciseGuide {
+  framingTip: string;
+  targetLabel: string;
+  steps: readonly [string, string, string];
+}
+
 export interface PostureMetrics {
   status: PostureStatus;
   score: number;
@@ -56,6 +100,7 @@ export interface ExerciseSnapshot {
   phase: ExercisePhase;
   feedback: string;
   completed: boolean;
+  hasReachedPeak: boolean;
 }
 
 export interface ExerciseTracker {
@@ -71,9 +116,15 @@ export interface SessionSummary {
   framesAnalyzed: number;
   optimalFrames: number;
   alertFrames: number;
+  warningFrames: number;
+  riskFrames: number;
+  worstNeckAngleDeg: number | null;
   lastInferenceMs: number | null;
   backend: string;
   postureHistory: PostureStatus[];
+  timelineSampleCount: number;
+  historyEvents: SessionHistoryEvent[];
+  activeEpisodeId: string | null;
 }
 
 export interface PoseInferenceResult {

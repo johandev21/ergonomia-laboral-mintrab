@@ -15,6 +15,7 @@ import type {
 } from "../types/ergonomics.types";
 import { CalibrationPanel } from "./calibration-panel";
 import { EvaluationPanel } from "./evaluation-panel";
+import { HistoryPanel } from "./history-panel";
 import { KeypointsTable } from "./keypoints-table";
 import { PostureStage } from "./posture-stage";
 import { WorkbenchTopbar } from "./workbench-topbar";
@@ -33,23 +34,26 @@ export function ErgonomicsWorkbench({
 
   return (
     <div className="workbench-shell">
-      <WorkbenchTopbar mode={sessionState.mode} onModeChange={sessionState.setMode} />
+      <WorkbenchTopbar mode={sessionState.mode} onModeChange={sessionState.handleModeChange} />
 
       <main className="workbench-main">
         <PostureStage
           videoRef={sessionState.videoRef}
           canvasRef={sessionState.canvasRef}
+          mode={sessionState.mode}
+          exercise={sessionState.exercise}
           cameraActive={sessionState.cameraActive}
           photoActive={sessionState.photoActive}
           engineLoading={sessionState.engineLoading}
           photoFiles={sessionState.photoFiles}
-          postureHistory={sessionState.session.postureHistory}
+          session={sessionState.session}
           statusMessage={sessionState.statusMessage}
           statusTone={sessionState.statusTone}
           statusFileName={sessionState.statusFileName}
           onStartCamera={() => void sessionState.handleStartCamera()}
           onStopCamera={sessionState.handleStopCamera}
           onSelectPhotos={(files) => void sessionState.handlePhotoSelection(files)}
+          onSelectExercise={sessionState.handleExerciseChange}
           onResetSession={sessionState.handleResetSession}
           onClearRecords={sessionState.handleClearRecords}
         />
@@ -65,8 +69,12 @@ export function ErgonomicsWorkbench({
           exerciseSnapshot={sessionState.exerciseSnapshot}
           session={sessionState.session}
           onExerciseChange={sessionState.handleExerciseChange}
+          onTargetRepsChange={sessionState.handleTargetRepsChange}
+          onNextExercise={sessionState.handleNextExercise}
+          onRepeatExercise={sessionState.handleRepeatExercise}
           onCalibrationChange={sessionState.setCalibration}
           onModelVariantChange={(variant) => void sessionState.handleModelVariantChange(variant)}
+          onExportHistoryCsv={sessionState.handleExportHistoryCsv}
         />
       </main>
     </div>
@@ -84,8 +92,12 @@ interface ErgonomicsInspectorProps {
   exerciseSnapshot: ExerciseSnapshot;
   session: SessionSummary;
   onExerciseChange: (exercise: ExerciseType) => void;
+  onTargetRepsChange: (reps: number) => void;
+  onNextExercise: () => void;
+  onRepeatExercise: () => void;
   onCalibrationChange: Dispatch<SetStateAction<CalibrationSettings>>;
   onModelVariantChange: (variant: ModelVariant) => void;
+  onExportHistoryCsv: () => void;
 }
 
 function ErgonomicsInspector({
@@ -99,9 +111,15 @@ function ErgonomicsInspector({
   exerciseSnapshot,
   session,
   onExerciseChange,
+  onTargetRepsChange,
+  onNextExercise,
+  onRepeatExercise,
   onCalibrationChange,
   onModelVariantChange,
+  onExportHistoryCsv,
 }: ErgonomicsInspectorProps) {
+  const totalEvents = session.historyEvents.length;
+
   return (
     <aside className="inspector-panel" aria-label="Inspector ergonómico">
       <Tabs
@@ -114,6 +132,14 @@ function ErgonomicsInspector({
           <TabsTab value="evaluacion">Evaluación</TabsTab>
           <TabsTab value="calibracion">Calibración</TabsTab>
           <TabsTab value="puntos">Puntos clave</TabsTab>
+          <TabsTab value="historial">
+            Historial
+            {totalEvents > 0 ? (
+              <span className="tab-count" aria-hidden="true">
+                {totalEvents}
+              </span>
+            ) : null}
+          </TabsTab>
           <TabsIndicator />
         </TabsList>
 
@@ -126,6 +152,9 @@ function ErgonomicsInspector({
             targetReps={calibration.targetReps}
             session={session}
             onExerciseChange={onExerciseChange}
+            onTargetRepsChange={onTargetRepsChange}
+            onNextExercise={onNextExercise}
+            onRepeatExercise={onRepeatExercise}
           />
         </TabsPanel>
 
@@ -138,7 +167,15 @@ function ErgonomicsInspector({
         </TabsPanel>
 
         <TabsPanel value="puntos">
-          <KeypointsTable keypoints={keypoints} minConfidence={calibration.minConfidence} />
+          {activeTab === "puntos" ? (
+            <KeypointsTable keypoints={keypoints} minConfidence={calibration.minConfidence} />
+          ) : null}
+        </TabsPanel>
+
+        <TabsPanel value="historial">
+          {activeTab === "historial" ? (
+            <HistoryPanel session={session} onExportCsv={onExportHistoryCsv} />
+          ) : null}
         </TabsPanel>
       </Tabs>
     </aside>

@@ -1,13 +1,18 @@
 import { describe, expect, it } from "vite-plus/test";
 import {
   DEFAULT_CALIBRATION,
+  HISTORY_STORAGE_KEY,
   KEYPOINT_META,
   SKELETON_EDGES,
+  buildHistoryCsv,
   calculateAngle,
+  compressTimelineToSlots,
   createExerciseTracker,
+  createSessionHistoryStore,
   evaluateDeskPosture,
   normalizeKeypoints,
   type PoseKeypoint,
+  type TimelineBucket,
 } from "../features/ergonomics";
 
 function makePose(
@@ -270,6 +275,31 @@ describe("createExerciseTracker", () => {
     expect(tracker.getSnapshot().completed).toBe(true);
   });
 
+  it("counts seated arm-raise reps without visible hips using vertical shoulder fallback", () => {
+    const tracker = createExerciseTracker("arm-raise", 1);
+    const seatedDown = makePose({
+      6: { x: 360, y: 220, score: 0.95 },
+      10: { x: 375, y: 350, score: 0.94 },
+    });
+    const seatedUp = makePose({
+      6: { x: 360, y: 220, score: 0.95 },
+      10: { x: 365, y: 80, score: 0.94 },
+    });
+
+    for (let i = 0; i < 3; i += 1) tracker.update(seatedDown, settings);
+    expect(tracker.getSnapshot().phase).toBe("abajo");
+    expect(tracker.getSnapshot().hasReachedPeak).toBe(false);
+
+    for (let i = 0; i < 3; i += 1) tracker.update(seatedUp, settings);
+    expect(tracker.getSnapshot().phase).toBe("arriba");
+    expect(tracker.getSnapshot().hasReachedPeak).toBe(true);
+
+    for (let i = 0; i < 3; i += 1) tracker.update(seatedDown, settings);
+    expect(tracker.getSnapshot().reps).toBe(1);
+    expect(tracker.getSnapshot().completed).toBe(true);
+    expect(tracker.getSnapshot().hasReachedPeak).toBe(false);
+  });
+
   it("counts neck-tilt reps when holding stretch and returning to neutral", () => {
     const tracker = createExerciseTracker("neck-tilt", 1);
     const neutral = makeNeckTiltPose("neutral");
@@ -285,5 +315,175 @@ describe("createExerciseTracker", () => {
     for (let i = 0; i < 3; i += 1) tracker.update(neutral, settings);
     expect(tracker.getSnapshot().reps).toBe(1);
     expect(tracker.getSnapshot().completed).toBe(true);
+  });
+});
+
+describe("createSessionHistoryStore and CSV export", () => {
+  function createMemoryStorage(): Storage {
+    const map = new Map<string, string>();
+    return {
+      get length() {
+        return map.size;
+      },
+      clear() {
+        map.clear();
+      },
+      getItem(key: string) {
+        return map.get(key) ?? null;
+      },
+      key(index: number) {
+        return Array.from(map.keys())[index] ?? null;
+      },
+      removeItem(key: string) {
+        map.delete(key);
+      },
+      setItem(key: string, value: string) {
+        map.set(key, value);
+      },
+    };
+  }
+
+  const optimalMetrics = {
+    status: "optima" as const,
+    score: 96,
+    neckAngleDeg: 5,
+    shoulderTiltDeg: 1,
+    torsoLeanDeg: 3,
+    diagnosis: "Postura alineada.",
+    recommendation: "Mantén la postura.",
+    visibleCount: 17,
+  };
+
+  const warningMetrics = {
+    status: "advertencia" as const,
+    score: 68,
+    neckAngleDeg: 22,
+    shoulderTiltDeg: 2,
+    torsoLeanDeg: 4,
+    diagnosis: "Inclinación cervical leve (22° sobre el eje vertical).",
+    recommendation: "Lleva el mentón hacia atrás.",
+    visibleCount: 17,
+  };
+
+  const riskMetrics = {
+    status: "riesgo" as const,
+    score: 42,
+    neckAngleDeg: 31,
+    shoulderTiltDeg: 9,
+    torsoLeanDeg: 6,
+    diagnosis: "Sobrecarga cervical marcada (31° de adelantamiento cefálico).",
+    recommendation: "Sube el monitor.",
+    visibleCount: 17,
+  };
+
+  it("retains bad-posture episodes and worst timeline severity after returning to optimal posture", () => {
+    const storage = createMemoryStorage();
+    const store = createSessionHistoryStore({ storage });
+
+    // 1-2 frames of bad posture should be ignored as noise
+    store.recordFrame({ posture: warningMetrics, inferenceMs: 12, now: 1000, source: "camara" });
+    store.recordFrame({ posture: warningMetrics, inferenceMs: 12, now: 1040, source: "camara" });
+    store.recordFrame({ posture: optimalMetrics, inferenceMs: 12, now: 1080, source: "camara" });
+    expect(store.getSummary().historyEvents).toHaveLength(0);
+
+    // 3+ frames open an episode, escalate to riesgo, then close on 2 optimal frames
+    store.recordFrame({ posture: warningMetrics, inferenceMs: 12, now: 2000, source: "camara" });
+    store.recordFrame({ posture: warningMetrics, inferenceMs: 12, now: 2100, source: "camara" });
+    const opened = store.recordFrame({
+      posture: riskMetrics,
+      inferenceMs: 12,
+      now: 2200,
+      source: "camara",
+    });
+    expect(opened.structuralChange).toBe(true);
+    expect(store.getSummary().activeEpisodeId).not.toBeNull();
+
+    store.recordFrame({ posture: optimalMetrics, inferenceMs: 12, now: 3500, source: "camara" });
+    const closed = store.recordFrame({
+      posture: optimalMetrics,
+      inferenceMs: 12,
+      now: 3600,
+      source: "camara",
+    });
+    expect(closed.structuralChange).toBe(true);
+    expect(closed.shouldPersist).toBe(true);
+    store.persist();
+
+    // Even after 40 more seconds of optimal posture, the episode and risk slot remain preserved
+    for (let s = 4; s <= 44; s += 1) {
+      store.recordFrame({
+        posture: optimalMetrics,
+        inferenceMs: 10,
+        now: s * 1000,
+        source: "camara",
+      });
+    }
+
+    const summary = store.getSummary();
+    expect(summary.activeEpisodeId).toBeNull();
+    expect(summary.historyEvents).toHaveLength(1);
+    const ep = summary.historyEvents[0];
+    expect(ep.kind).toBe("postura");
+    if (ep.kind === "postura") {
+      expect(ep.severity).toBe("riesgo");
+      expect(ep.minScore).toBe(42);
+      expect(ep.peakNeckAngleDeg).toBe(31);
+      expect(ep.durationMs).toBe(1600);
+    }
+    expect(summary.postureHistory).toHaveLength(28);
+    expect(summary.postureHistory).toContain("riesgo");
+
+    // Rehydrating from storage preserves persisted events and worst neck angle
+    const rehydrated = createSessionHistoryStore({ storage });
+    expect(rehydrated.getSummary().historyEvents).toHaveLength(1);
+    expect(rehydrated.getSummary().worstNeckAngleDeg).toBe(31);
+
+    // Clearing wipes both memory and storage
+    rehydrated.clearAll();
+    expect(rehydrated.getSummary().historyEvents).toHaveLength(0);
+    expect(storage.getItem(HISTORY_STORAGE_KEY)).toBeNull();
+  });
+
+  it("records completed breaks, compresses timeline preserving worst severity, and exports safe CSV", () => {
+    const storage = createMemoryStorage();
+    const store = createSessionHistoryStore({ storage });
+
+    store.recordFrame({
+      posture: riskMetrics,
+      inferenceMs: 15,
+      now: 1700000000000,
+      source: "foto",
+      fileName: "=peligro.jpg",
+    });
+    store.recordCompletedBreak("squat", 10, 10, 1700000060000);
+
+    const events = store.getSummary().historyEvents;
+    expect(events).toHaveLength(2);
+    expect(events[0].kind).toBe("pausa");
+    expect(events[1].kind).toBe("postura");
+
+    const csv = buildHistoryCsv(events);
+    expect(csv.startsWith("\uFEFF")).toBe(true);
+    expect(csv).toContain("Sentadillas asistidas (10/10 repeticiones)");
+    expect(csv).toContain("Riesgo");
+    expect(csv).toContain("Fotografía: =peligro.jpg");
+
+    const buckets: TimelineBucket[] = Array.from({ length: 60 }, (_, i) => ({
+      timestamp: i * 1000,
+      status: i === 5 ? "riesgo" : i === 25 ? "advertencia" : "optima",
+      minScore: i === 5 ? 40 : i === 25 ? 70 : 95,
+    }));
+    const slots = compressTimelineToSlots(buckets, 28);
+    expect(slots).toHaveLength(28);
+    expect(slots).toContain("riesgo");
+    expect(slots).toContain("advertencia");
+
+    // Active-break frames increment telemetry without adding false posture alerts or timeline slots
+    const beforeAlerts = store.getSummary().alertFrames;
+    const beforeSamples = store.getSummary().timelineSampleCount;
+    store.recordActiveBreakFrame(13.5);
+    expect(store.getSummary().alertFrames).toBe(beforeAlerts);
+    expect(store.getSummary().timelineSampleCount).toBe(beforeSamples);
+    expect(store.getSummary().lastInferenceMs).toBe(13.5);
   });
 });
